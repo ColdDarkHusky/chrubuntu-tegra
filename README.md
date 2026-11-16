@@ -4,6 +4,23 @@ HP Chromebook 14 G3 / Acer Chromebook 13 (board: `nyan`, `nyan_blaze`, ...).
 Based on the work of arm000 found
 [here](http://www.reddit.com/r/chrubuntu/comments/2hhb31/chrubuntu_on_acer_chromebook_13/).
 
+## Short links
+
+| What | Link |
+|---|---|
+| This repo | https://is.gd/chrubuntu_tegra |
+| Installer script | https://is.gd/chrubuntu_sh |
+| Boot fixer | https://is.gd/chrubuntu_fix |
+
+Download to a file, then run it — do not pipe into `sudo bash`, because a sudo
+password prompt reads the piped script and runs nothing:
+
+                $ curl -fsSL https://is.gd/chrubuntu_sh -o /tmp/i.sh
+                $ sudo bash /tmp/i.sh default 22.04 /dev/mmcblk1
+
+                $ curl -fsSL https://is.gd/chrubuntu_fix -o /tmp/f.sh
+                $ sudo bash /tmp/f.sh
+
 ## What is supported now
 
 | | |
