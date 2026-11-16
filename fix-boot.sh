@@ -2,7 +2,12 @@
 # fix-boot.sh - make a finished ChrUbuntu install actually boot
 #
 # Run in a ChromeOS dev-mode shell (Ctrl-Alt-T, type "shell"):
-#   curl -sL https://is.gd/chrubuntu_fix | sudo bash
+#   cd /tmp
+#   curl -fLo fix-boot.sh https://raw.githubusercontent.com/ColdDarkHusky/chrubuntu-tegra/master/fix-boot.sh
+#   sudo bash fix-boot.sh
+#
+# Do not pipe this into "sudo bash": if sudo wants a password it reads it from
+# the pipe and swallows the script, which then runs nothing at all.
 #
 # It sets the two firmware flags the installer needs, finds the disk that
 # holds the Ubuntu root filesystem, and re-arms its kernel partition. Safe to
@@ -14,7 +19,7 @@ say()  { echo "==> $*"; }
 note() { echo "    $*"; }
 fail() { echo "" >&2; echo "ERROR: $*" >&2; exit 1; }
 
-[ "`id -u`" = "0" ] || fail "run with sudo: curl -sL https://is.gd/chrubuntu_fix | sudo bash"
+[ "`id -u`" = "0" ] || fail "run with sudo: sudo bash fix-boot.sh"
 
 if ! command -v crossystem >/dev/null 2>&1 || ! command -v cgpt >/dev/null 2>&1
 then
@@ -95,6 +100,6 @@ Done. Power the Chromebook fully off (not reboot), leave the card in, and
 power it on. Do not press Ctrl-D - that boots the internal disk - and do not
 press anything else; the firmware tries the card by itself.
 
-If it still starts ChromeOS, run this once and send me the output:
-  sudo bash -x <(curl -sL https://is.gd/chrubuntu_fix)
+If it still starts ChromeOS, re-run this with tracing and send the output:
+  sudo bash -x fix-boot.sh
 EOF
