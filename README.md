@@ -127,6 +127,20 @@ the device boots into ChromeOS instead of Ubuntu, run the command above again.
 * `Your Chromebook is not in developer mode` — run
   `sudo chromeos-firmwareupdate --mode=todev`, or `FORCE=1` if you know the
   device already boots unsigned kernels.
+* The install finishes, but the Chromebook boots straight back into ChromeOS
+  (or Ctrl-D just returns to the boot screen). The firmware is refusing the
+  dev-signed kernel. Two flags have to be on, and pressing Ctrl-D will not
+  help: it means "boot the internal disk".
+
+                    $ sudo crossystem dev_boot_signed_only=0 dev_boot_usb=1
+                    $ sudo crossystem dev_boot_usb dev_boot_signed_only
+                    1  0
+
+  Then power off (not reboot), leave the card in, and power on without
+  pressing anything. If the one-shot boot counter was already spent, restore
+  it (this also makes Ubuntu the permanent default):
+
+                    $ sudo cgpt add -i 6 -P 5 -S 1 /dev/mmcblk1
 * `no ubuntu-base image for Ubuntu X on armhf` — that release was never built
   for your CPU; the script names a release that exists in the error message.
 * `Refusing to continue since /dev/mmcblk0p7 is formatted and mounted` — an

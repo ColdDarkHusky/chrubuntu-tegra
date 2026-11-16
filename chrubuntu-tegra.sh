@@ -117,6 +117,19 @@ if [ ! "$fw_type" = "developer" ] && [ "$dev_switch" != "1" ] && [ "$FORCE" != "
     exit 1
 fi
 
+# The kernel installed below is signed with the ChromeOS *developer* keys. With
+# dev_boot_signed_only=1 the firmware silently refuses it and boots ChromeOS
+# instead, which looks exactly like "the install did nothing". Booting from an
+# SD card or USB stick also needs dev_boot_usb=1.
+crossystem dev_boot_signed_only=0 >/dev/null 2>&1 || true
+crossystem dev_boot_usb=1 >/dev/null 2>&1 || true
+signed_only="`crossystem dev_boot_signed_only 2>/dev/null || true`"
+if [ "$signed_only" = "1" ]; then
+  echo "WARNING: the firmware still reports dev_boot_signed_only=1." >&2
+  echo "         Run this once by hand, then retry:" >&2
+  echo "           sudo crossystem dev_boot_signed_only=0 dev_boot_usb=1" >&2
+fi
+
 # powerd blanks the screen while the install runs.
 if have stop; then
   stop powerd >/dev/null 2>&1 || true
