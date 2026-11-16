@@ -1,58 +1,164 @@
+#!/bin/bash
+# chrubuntu-tegra.sh - install Ubuntu on a Tegra Chromebook
+# (HP Chromebook 14 G3 / nyan, Acer Chromebook 13 / nyan_blaze, ...)
+#
+# usage: sudo bash chrubuntu-tegra.sh [metapackage] [version] [device]
+#   metapackage  default | ubuntu-desktop | xubuntu-desktop | ubuntu-minimal ...
+#   version      latest | lts | dev | 22.04 | 24.04 | 26.04 ...
+#   device       optional medium to install to, e.g. /dev/mmcblk1 (SD card or
+#                USB stick). Omit it to install next to ChromeOS.
+#
+# examples:
+#   sudo bash chrubuntu-tegra.sh default latest /dev/mmcblk1
+#   sudo bash chrubuntu-tegra.sh xubuntu-desktop lts
+#
+# environment switches:
+#   NO_L4T=1       skip the NVIDIA L4T GPU blobs (software rendering instead)
+#   L4T_URL=...    use a different NVIDIA L4T package URL
+#   NO_BROWSER=1   install no web browser
+#   ZRAM=0         do not set up zram swap
+#   FORCE=1        skip the confirmation prompts
+
 set -e
 
-# example use:
-#   1. Prepare MMC card on a different computer using the format_mmc
-#      script. Stock chrome os does not carry cgpt any more
-#   2. Then download this script to a /tmp folder and from there run: 
-#      sudo bash chrubuntu-tegra.sh default 14.04 /dev/mmcblk1
+# ChromeOS no longer ships wget; curl is part of every build. This keeps the
+# script working on both old and current ChromeOS without extra packages.
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# fw_type will always be developer for Mario.
-# Alex and ZGB need the developer BIOS installed though.
-fw_type="`crossystem mainfw_type`"
-if [ ! "$fw_type" = "developer" ]
+# cgpt/crossystem/rootdev/vbutil_kernel moved between ChromeOS releases.
+if [ -d /usr/bin/old_bins ]; then
+  PATH="/usr/bin/old_bins:$PATH"
+  export PATH
+fi
+
+for tool in cgpt crossystem rootdev; do
+  if ! have "$tool"; then
+    echo "ERROR: '$tool' not found. Run this from a ChromeOS dev-mode shell" >&2
+    echo "       (not from inside an installed Ubuntu)." >&2
+    exit 1
+  fi
+done
+
+if have curl; then
+  NETCTL=curl
+elif have wget; then
+  NETCTL=wget
+elif have python3; then
+  NETCTL=python
+else
+  echo "ERROR: need curl to download Ubuntu, but it is not available." >&2
+  exit 1
+fi
+
+http_get() {
+  # http_get URL - prints the body to stdout
+  case "$NETCTL" in
+    curl)   curl -fsSL --retry 3 --retry-delay 2 --max-time 300 "$1" ;;
+    wget)   wget -q -O - "$1" ;;
+    python) python3 - "$1" <<'PY'
+import sys, urllib.request
+print(urllib.request.urlopen(sys.argv[1], timeout=300).read().decode('utf-8', 'replace'), end='')
+PY
+  esac
+}
+
+http_size() {
+  # http_size URL - prints Content-Length when the server sends one
+  case "$NETCTL" in
+    curl) curl -fsSLI --max-time 30 "$1" 2>/dev/null | tr -d '\r' \
+            | awk 'BEGIN{IGNORECASE=1}/^content-length:/{print $2}' | tail -1 ;;
+    wget) wget --spider -S -O /dev/null "$1" 2>&1 | tr -d '\r' \
+            | awk 'BEGIN{IGNORECASE=1}/Content-Length:/{print $2}' | tail -1 ;;
+    python) python3 - "$1" <<'PY'
+import sys, urllib.request
+try:
+    req = urllib.request.Request(sys.argv[1], method='HEAD')
+    print(urllib.request.urlopen(req, timeout=60).headers.get('Content-Length', ''))
+except Exception:
+    pass
+PY
+  esac
+}
+
+fetch_to() {
+  # fetch_to URL DEST - downloads a file, retrying on network errors
+  echo "  downloading $(basename "$2") ..."
+  case "$NETCTL" in
+    curl)   curl -fSL --retry 3 --retry-delay 3 --max-time 900 -o "$2" "$1" ;;
+    wget)   wget -q --tries=3 -O "$2" "$1" ;;
+    python) python3 - "$1" "$2" <<'PY'
+import shutil, sys, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=900) as r, open(sys.argv[2], 'wb') as f:
+    shutil.copyfileobj(r, f)
+PY
+  esac
+}
+
+ask_continue() {
+  if [ "$FORCE" = "1" ]; then
+    return 0
+  fi
+  read -p "$1" _
+}
+
+# fw_type is 'developer' in dev mode. Old devices also need the developer
+# firmware (chromeos-firmwareupdate --mode=todev) before a custom kernel boots.
+fw_type="`crossystem mainfw_type 2>/dev/null || true`"
+dev_switch="`crossystem devsw_boot 2>/dev/null || true`"
+if [ ! "$fw_type" = "developer" ] && [ "$dev_switch" != "1" ] && [ "$FORCE" != "1" ]
   then
-    echo -e "\nYour Chromebook is not running a developer BIOS!"
+    echo -e "\nYour Chromebook is not in developer mode!"
     echo -e "You need to run:"
     echo -e ""
     echo -e "sudo chromeos-firmwareupdate --mode=todev"
+    echo -e "sudo crossystem dev_boot_signed_only=0 dev_boot_usb=1"
     echo -e ""
-    echo -e "and then re-run this script."
-    exit
+    echo -e "and then re-run this script (FORCE=1 skips this check)."
+    exit 1
 fi
 
-powerd_status="`initctl status powerd`"
-if [ ! "$powerd_status" = "powerd stop/waiting" ]
-then
-  echo -e "Stopping powerd to keep display from timing out..."
-  initctl stop powerd
+# powerd blanks the screen while the install runs.
+if have stop; then
+  stop powerd >/dev/null 2>&1 || true
+elif have initctl && initctl status powerd >/dev/null 2>&1; then
+  initctl stop powerd >/dev/null 2>&1 || true
 fi
 
-setterm -blank 0
+setterm -blank 0 2>/dev/null || true
 
 if [ "$3" != "" ]; then
   target_disk=$3
+  if [ ! -b "$target_disk" ]
+  then
+    echo "ERROR: $target_disk is not a block device. Check the name with lsblk." >&2
+    exit 1
+  fi
   echo "Got ${target_disk} as target drive"
   echo ""
   echo "WARNING! All data on this device will be wiped out! Continue at your own risk!"
   echo ""
-  read -p "Press [Enter] to install ChrUbuntu on ${target_disk} or CTRL+C to quit"
+  ask_continue "Press [Enter] to install ChrUbuntu on ${target_disk} or CTRL+C to quit"
 
-  ext_size="`blockdev --getsz ${target_disk}`"
+  # blockdev is not in every ChromeOS build; cgpt can report the size too.
+  ext_size="`blockdev --getsz "$target_disk" 2>/dev/null || cgpt show -s -q "$target_disk"`"
+  if [ -z "$ext_size" ]; then
+    echo "ERROR: could not read the size of ${target_disk}." >&2
+    exit 1
+  fi
   aroot_size=$((ext_size - 65600 - 33 - 4*1024*1024*1024/512))
-  # Unfortunately parted and partprobe are no longer in the latest chromeos.
-  # You must run the parted command below on your desktop Linux machine, where
-  # ${target_disk} is your SDCard device, eg, /dev/sdb, *before* you run
-  # this script on your chromebook.
-  #parted --script ${target_disk} "mktable gpt"
-  cgpt create ${target_disk}
+  if [ "$aroot_size" -le 0 ]; then
+    echo "ERROR: ${target_disk} is too small; use at least a 8 GB card." >&2
+    exit 1
+  fi
+  # parted and partprobe are gone from ChromeOS; cgpt creates the GPT itself,
+  # so a pre-formatted card is no longer required.
+  cgpt create ${target_disk} || true
   # 32 and 16 GB disks work above but not 4 GB
   cgpt add -i 6 -b 64 -s 32768 -S 1 -P 5 -l KERN-A -t "kernel" ${target_disk}
   cgpt add -i 7 -b 65600 -s $aroot_size -l ROOT-A -t "rootfs" ${target_disk}
   sync
-  blockdev --rereadpt ${target_disk}
-  # no longer in latest chromeos
-  #partprobe ${target_disk}
-  crossystem dev_boot_usb=1
+  blockdev --rereadpt ${target_disk} 2>/dev/null || true
+  crossystem dev_boot_usb=1 || true
 else
   target_disk="`rootdev -d -s`"
   # Do partitioning (if we haven't already)
@@ -63,17 +169,18 @@ else
   max_ubuntu_size=$(($state_size/1024/1024/2))
   rec_ubuntu_size=$(($max_ubuntu_size - 1))
   # If KERN-C and ROOT-C are one, we partition, otherwise assume they're what they need to be...
-  if [ "$ckern_size" =  "1" -o "$croot_size" = "1" ]
+  if [ "$ckern_size" = "1" ] || [ "$croot_size" = "1" ]
   then
     while :
     do
       read -p "Enter the size in gigabytes you want to reserve for Ubuntu. Acceptable range is 5 to $max_ubuntu_size  but $rec_ubuntu_size is the recommended maximum: " ubuntu_size
-      if [ ! $ubuntu_size -ne 0 2>/dev/null ]
-      then
-        echo -e "\n\nNumbers only please...\n\n"
-        continue
-      fi
-      if [ $ubuntu_size -lt 5 -o $ubuntu_size -gt $max_ubuntu_size ]
+      case "$ubuntu_size" in
+        ''|*[!0-9]*)
+          echo -e "\n\nNumbers only please...\n\n"
+          continue
+          ;;
+      esac
+      if [ "$ubuntu_size" -lt 5 ] || [ "$ubuntu_size" -gt "$max_ubuntu_size" ]
       then
         echo -e "\n\nThat number is out of range. Enter a number 5 through $max_ubuntu_size\n\n"
         continue
@@ -105,7 +212,16 @@ else
     echo -e "\n\nModifying partition table to make room for Ubuntu."
     echo -e "Your Chromebook will reboot, wipe your data and then"
     echo -e "you should re-run this script..."
-    umount -f /mnt/stateful_partition
+    if ! umount -f /mnt/stateful_partition 2>/dev/null
+    then
+      echo "Could not unmount /mnt/stateful_partition; trying a lazy unmount."
+      umount -l /mnt/stateful_partition 2>/dev/null || true
+    fi
+    if mount | grep -q "on /mnt/stateful_partition "
+    then
+      echo "ERROR: /mnt/stateful_partition is still mounted. Reboot and re-run." >&2
+      exit 1
+    fi
 
     # stateful first
     cgpt add -i 1 -b $stateful_start -s $stateful_size -l STATE ${target_disk}
@@ -121,22 +237,44 @@ else
   fi
 fi
 
-# hwid lets us know if this is a Mario (Cr-48), Alex (Samsung Series 5), ZGB (Acer), etc
-hwid="`crossystem hwid`"
+# hwid identifies the model (an HP Chromebook 14 G3 reports nyan_blaze).
+hwid="`crossystem hwid 2>/dev/null || echo unknown`"
+board="`crossystem board 2>/dev/null || echo unknown`"
 
 chromebook_arch="`uname -m`"
 
 ubuntu_metapackage=${1:-default}
 
-latest_ubuntu=`wget --quiet -O - http://changelogs.ubuntu.com/meta-release | grep "^Version: " | tail -1 | sed -r 's/^Version: ([^ ]+)( LTS)?$/\1/'`
-ubuntu_version=${2:-$latest_ubuntu}
+META_RELEASE="https://changelogs.ubuntu.com/meta-release"
+META_DEV="https://changelogs.ubuntu.com/meta-release-development"
 
-if [ "$ubuntu_version" = "lts" ]
-then
-  ubuntu_version=`wget --quiet -O - http://changelogs.ubuntu.com/meta-release | grep "^Version:" | grep "LTS" | tail -1 | sed -r 's/^Version: ([^ ]+)( LTS)?$/\1/'`
-elif [ "$ubuntu_version" = "latest" ]
-then
-  ubuntu_version=$latest_ubuntu
+echo "Reading the Ubuntu release list from changelogs.ubuntu.com ..."
+meta="`http_get "$META_RELEASE"`"
+latest_ubuntu="`echo "$meta" | awk '/^Version:/{v=$2} END{print v}'`"
+latest_lts="`echo "$meta" | awk '/^Version:/ && /LTS/{v=$2} END{print v}'`"
+
+ubuntu_version=${2:-$latest_ubuntu}
+ubuntu_dist=""
+
+case "$ubuntu_version" in
+  latest)
+    ubuntu_version=$latest_ubuntu
+    ;;
+  lts)
+    ubuntu_version=$latest_lts
+    ;;
+  dev)
+    # The old ubuntu-core daily images are gone; dev releases are published
+    # under their codename in the normal ubuntu-base tree now.
+    ubuntu_dist="`http_get "$META_DEV" | awk '/^Dist:/{d=$2} END{print d}'`"
+    ubuntu_version=$ubuntu_dist
+    ;;
+esac
+
+if [ -z "$ubuntu_version" ]; then
+  echo "ERROR: could not read the Ubuntu release list from $META_RELEASE" >&2
+  echo "       (check the network connection and try again)." >&2
+  exit 1
 fi
 
 if [ "$chromebook_arch" = "x86_64" ]
@@ -153,26 +291,65 @@ then
   then
     ubuntu_metapackage="ubuntu-desktop"
   fi
-elif [ "$chromebook_arch" = "armv7l" ]
+elif [ "$chromebook_arch" = "armv7l" ] || [ "$chromebook_arch" = "armv8l" ]
 then
   ubuntu_arch="armhf"
   if [ "$ubuntu_metapackage" = "default" ]
   then
     ubuntu_metapackage="xubuntu-desktop"
   fi
+elif [ "$chromebook_arch" = "aarch64" ]
+then
+  ubuntu_arch="arm64"
+  if [ "$ubuntu_metapackage" = "default" ]
+  then
+    ubuntu_metapackage="xubuntu-desktop"
+  fi
 else
   echo -e "Error: This script doesn't know how to install ChrUbuntu on $chromebook_arch"
-  exit
+  exit 1
 fi
 
-echo -e "\nChrome device model is: $hwid\n"
+# The ubuntu-base tarballs are built per point release (22.04.5, 26.04.1...),
+# so ask cdimage which file actually exists instead of guessing one name.
+ubuntu_base_url() {
+  local index pick
+  index="`http_get "https://cdimage.ubuntu.com/ubuntu-base/releases/$1/release/" 2>/dev/null || true`"
+  pick="`echo "$index" | grep -o "ubuntu-base-[0-9][0-9.]*-base-$2\.tar\.gz" | sort -u -V | tail -1 || true`"
+  [ -n "$pick" ] || return 1
+  echo "https://cdimage.ubuntu.com/ubuntu-base/releases/$1/release/$pick"
+}
+
+echo "Resolving the Ubuntu base tarball for ${ubuntu_version}/${ubuntu_arch} ..."
+tar_file="`ubuntu_base_url "$ubuntu_version" "$ubuntu_arch" || true`"
+if [ -z "$tar_file" ] && echo "$ubuntu_version" | grep -q '^[0-9][0-9]*\.[0-9][0-9]*\.'
+then
+  # A point release (22.04.5) with no directory of its own still lives in the
+  # directory of its series (22.04).
+  ubuntu_series="${ubuntu_version%.*}"
+  tar_file="`ubuntu_base_url "$ubuntu_series" "$ubuntu_arch" || true`"
+fi
+if [ -z "$tar_file" ]; then
+  echo "" >&2
+  echo "ERROR: no ubuntu-base image for Ubuntu ${ubuntu_version} on ${ubuntu_arch}." >&2
+  echo "       armhf stopped getting desktop images after 22.04, so on this" >&2
+  echo "       machine (${board}) try: sudo bash $0 ${ubuntu_metapackage} 22.04" >&2
+  exit 1
+fi
+tar_size="`http_size "$tar_file" || true`"
+if [ -n "$tar_size" ]; then
+  tar_size="$((tar_size / 1024 / 1024)) MB"
+fi
+
+echo -e "\nChrome device model is: $hwid (board: $board)\n"
 
 echo -e "Installing Ubuntu ${ubuntu_version} with metapackage ${ubuntu_metapackage}\n"
 
 echo -e "Kernel Arch is: $chromebook_arch \n"
 echo -e "Installing Ubuntu Arch: $ubuntu_arch\n"
+echo -e "Base image: ${tar_file}${tar_size:+ (${tar_size})}\n"
 
-read -p "Press [Enter] to continue..."
+ask_continue "Press [Enter] to continue..."
 
 if [ ! -d /mnt/stateful_partition/ubuntu ]
 then
@@ -192,13 +369,21 @@ fi
 
 echo "Target Kernel Partition: $target_kern  Target Root FS: ${target_rootfs}"
 
-if mount|grep ${target_rootfs}
+if ! [ -b "$target_rootfs" ]
 then
-  echo "Refusing to continue since ${target_rootfs} is formatted and mounted. Try rebooting"
-  exit
+  echo "Refusing to continue: ${target_rootfs} does not exist." >&2
+  echo "Check that the card is inserted and that ${target_disk} is the right disk" >&2
+  echo "(lsblk lists them; partitions are ${target_disk}7 or ${target_disk}p7)." >&2
+  exit 1
 fi
 
-mkfs.ext4 ${target_rootfs}
+if mount | grep -q "^${target_rootfs} on "
+then
+  echo "Refusing to continue since ${target_rootfs} is formatted and mounted. Try rebooting"
+  exit 1
+fi
+
+mkfs.ext4 -F ${target_rootfs}
 
 if [ ! -d /tmp/urfs ]
 then
@@ -206,33 +391,40 @@ then
 fi
 mount -t ext4 ${target_rootfs} /tmp/urfs
 
-tar_file="http://cdimage.ubuntu.com/ubuntu-base/releases/$ubuntu_version/release/ubuntu-base-$ubuntu_version-base-$ubuntu_arch.tar.gz"
-if [ $ubuntu_version = "dev" ]
-then
-  ubuntu_animal=`wget --quiet -O - http://changelogs.ubuntu.com/meta-release-development | grep "^Dist: " | tail -1 | sed -r 's/^Dist: (.*)$/\1/'`
-  tar_file="http://cdimage.ubuntu.com/ubuntu-core/daily/current/$ubuntu_animal-core-$ubuntu_arch.tar.gz"
+echo "Downloading the Ubuntu base image ..."
+tarball="`mktemp`"
+fetch_to "$tar_file" "$tarball"
+if [ ! -s "$tarball" ]; then
+  echo "ERROR: the download of $tar_file produced no data." >&2
+  exit 1
 fi
-wget -O - $tar_file | tar xzvvp -C /tmp/urfs/
+echo "Extracting the base image (this takes a while) ..."
+tar xzvvp -f "$tarball" -C /tmp/urfs/
+rm -f "$tarball"
 
 mount -o bind /proc /tmp/urfs/proc
 mount -o bind /dev /tmp/urfs/dev
 mount -o bind /dev/pts /tmp/urfs/dev/pts
 mount -o bind /sys /tmp/urfs/sys
 
-if [ -f /usr/bin/old_bins/cgpt ]
+cgpt_bin="`command -v cgpt || true`"
+if [ -n "$cgpt_bin" ]
 then
-  cp /usr/bin/old_bins/cgpt /tmp/urfs/usr/bin/
+  cp "$cgpt_bin" /tmp/urfs/usr/bin/cgpt
+  chmod a+rx /tmp/urfs/usr/bin/cgpt
 else
-  cp /usr/bin/cgpt /tmp/urfs/usr/bin/
+  echo "WARNING: cgpt not found; the installed Ubuntu will not be able to" >&2
+  echo "         switch its boot partition by itself." >&2
 fi
-
-chmod a+rx /tmp/urfs/usr/bin/cgpt
-if [ ! -d /tmp/urfs/run/resolvconf/ ]
+# DNS inside the chroot. ChromeOS points /etc/resolv.conf at a runtime path,
+# so copy the resolved file (or write public resolvers when there is none).
+rm -f /tmp/urfs/etc/resolv.conf
+if ! cp -L /etc/resolv.conf /tmp/urfs/etc/resolv.conf 2>/dev/null || [ ! -s /tmp/urfs/etc/resolv.conf ]
 then
-  mkdir /tmp/urfs/run/resolvconf/
+  printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /tmp/urfs/etc/resolv.conf
 fi
-cp /etc/resolv.conf /tmp/urfs/run/resolvconf/
-ln -s -f /run/resolvconf/resolv.conf /tmp/urfs/etc/resolv.conf
+mkdir -p /tmp/urfs/run/resolvconf
+cp /tmp/urfs/etc/resolv.conf /tmp/urfs/run/resolvconf/resolv.conf
 echo chrubuntu > /tmp/urfs/etc/hostname
 #echo -e "127.0.0.1       localhost
 echo -e "\n127.0.1.1       chrubuntu" >> /tmp/urfs/etc/hosts
@@ -243,82 +435,87 @@ echo -e "\n127.0.1.1       chrubuntu" >> /tmp/urfs/etc/hosts
 #ff02::1 ip6-allnodes
 #ff02::2 ip6-allrouters" > /tmp/urfs/etc/hosts
 
-cr_install="wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-add-apt-repository \"deb http://dl.google.com/linux/chrome/deb/ stable main\"
-apt-get update
-apt-get -y install google-chrome-stable"
-if [ $ubuntu_arch = 'armhf' ]
+# Google Chrome dropped the apt-key shortcut; keys now go into a keyring file.
+cr_install='install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+apt-get -y update
+apt-get -y install google-chrome-stable'
+
+if [ "$ubuntu_arch" != "amd64" ]
 then
-  cr_install='apt-get -y install chromium-browser'
+  # There is no armhf Google Chrome, and Ubuntu's chromium package is a snap
+  # wrapper that cannot run inside a chroot, so use GNOME Web (epiphany).
+  cr_install='apt-get -y install epiphany-browser || apt-get -y install chromium-browser || true'
 fi
 
-add_apt_repository_package='software-properties-common'
-ubuntu_major_version=${ubuntu_version:0:2}
-ubuntu_minor_version=${ubuntu_version:3:2}
-if [ $ubuntu_major_version -le 12 ] && [ $ubuntu_minor_version -lt 10 ]
+if [ "$NO_BROWSER" = "1" ]
 then
-  add_apt_repository_package='python-software-properties'
+  cr_install=""
 fi
 
-echo -e "apt-get -y update
-touch /etc/init.d/whoopsie
+echo -e "export DEBIAN_FRONTEND=noninteractive
+apt-get -y update
+apt-get -y install ca-certificates curl gnupg locales
+mkdir -p /etc/init.d
+[ -e /etc/init.d/whoopsie ] || touch /etc/init.d/whoopsie
 apt-get -y dist-upgrade
 apt-get -y install ubuntu-minimal
-apt-get -y install wget
-apt-get -y install $add_apt_repository_package
-add-apt-repository main
-add-apt-repository universe
-add-apt-repository restricted
-add-apt-repository multiverse
-apt-get update
-apt-get -y install $ubuntu_metapackage
+apt-get -y install software-properties-common
+add-apt-repository -y universe
+add-apt-repository -y restricted
+add-apt-repository -y multiverse
+apt-get -y update
+apt-get -y install $ubuntu_metapackage || apt-get -y install ubuntu-minimal
 $cr_install
+if [ '$ZRAM' != '0' ]; then apt-get -y install zram-tools || true; fi
 if [ -f /usr/lib/lightdm/lightdm-set-defaults ]
 then
   /usr/lib/lightdm/lightdm-set-defaults --autologin user
 fi
-useradd -m user -s /bin/bash
-echo user | echo user:user | chpasswd
-adduser user adm
-adduser user sudo
-update-alternatives --set x-www-browser /usr/bin/chromium-browser
+useradd -m -s /bin/bash user
+echo 'user:user' | chpasswd
+adduser -q user adm 2>/dev/null || true
+adduser -q user sudo 2>/dev/null || true
+adduser -q user video 2>/dev/null || true
+adduser -q user audio 2>/dev/null || true
+adduser -q user plugdev 2>/dev/null || true
+adduser -q user netdev 2>/dev/null || true
+adduser -q user render 2>/dev/null || true
+if [ -x /usr/bin/epiphany-browser ]; then
+  update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/epiphany-browser 40 || true
+elif [ -x /usr/bin/google-chrome-stable ]; then
+  update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/google-chrome-stable 40 || true
+fi
 locale-gen en_US en_US.UTF-8
-echo -e 'LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8' > /etc/default/locale
-LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 dpkg-reconfigure locales" > /tmp/urfs/install-ubuntu.sh
+echo 'LANG=en_US.UTF-8' > /etc/default/locale
+echo 'LC_ALL=en_US.UTF-8' >> /etc/default/locale
+dpkg-reconfigure -f noninteractive locales" > /tmp/urfs/install-ubuntu.sh
 
 chmod a+x /tmp/urfs/install-ubuntu.sh
-chroot /tmp/urfs /bin/bash -c /install-ubuntu.sh
+chroot /tmp/urfs /bin/bash /install-ubuntu.sh
 rm /tmp/urfs/install-ubuntu.sh
 
-KERN_VER=`uname -r`
+KERN_VER="`uname -r`"
 mkdir -p /tmp/urfs/lib/modules/$KERN_VER/
-cp -ar /lib/modules/$KERN_VER/* /tmp/urfs/lib/modules/$KERN_VER/
-if [ ! -d /tmp/urfs/lib/firmware/ ]
+if [ -d /lib/modules/$KERN_VER ]
 then
-  mkdir /tmp/urfs/lib/firmware/
+  cp -ar /lib/modules/$KERN_VER/* /tmp/urfs/lib/modules/$KERN_VER/
+else
+  echo "WARNING: no kernel modules for $KERN_VER on this ChromeOS build." >&2
 fi
-cp -ar /lib/firmware/* /tmp/urfs/lib/firmware/
+mkdir -p /tmp/urfs/lib/firmware
+if [ -d /lib/firmware ]
+then
+  cp -ar /lib/firmware/* /tmp/urfs/lib/firmware/ || true
+fi
 
-
-# copy adobe flash player plugin
-cp /opt/google/chrome/pepper/libpepflashplayer.so /tmp/urfs/usr/lib/chromium-browser
-
-# tell chromium-browser where to find flash plugin
-echo -e 'CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ppapi-flash-path=/usr/lib/chromium-browser/libpepflashplayer.so"' >> /tmp/urfs/etc/chromium-browser/default
-
-# flash plugin requires a new version of libstdc++6 from test repository
-cat > /tmp/urfs/install-flash.sh <<EOF
-add-apt-repository -y ppa:ubuntu-toolchain-r/test
-apt-get update
-apt-get install -y libstdc++6
-EOF
-
-chmod a+x /tmp/urfs/install-flash.sh
-chroot /tmp/urfs /bin/bash -c /install-flash.sh
-rm /tmp/urfs/install-flash.sh
+# The Adobe Flash plugin ChromeOS used to ship is gone, so nothing is copied
+# here any more; browsers now need no PPAPI plugin.
 
 
 # from https://chromium.googlesource.com/chromiumos/platform/xorg-conf/+/factory-4128.B/tegra.conf
+mkdir -p /tmp/urfs/usr/share/X11/xorg.conf.d
 cat > /tmp/urfs/usr/share/X11/xorg.conf.d/tegra.conf << EOF
 Section "Module"
     Load        "glx"
@@ -379,24 +576,60 @@ Section "ServerFlags"
 EndSection
 EOF
 
-# BIG specific files here
-l4tdir=`mktemp -d`
-l4t=Tegra124_Linux_R21.1.0_armhf.tbz2
-wget -P ${l4tdir} http://developer.download.nvidia.com/mobile/tegra/l4t/r21.1.0/${l4t}
-cd ${l4tdir}
-tar xvpf ${l4t}
-cd Linux_for_Tegra/rootfs/
-tar xvpf ../nv_tegra/nvidia_drivers.tbz2
-tar cf - usr/lib | ( cd /tmp/urfs ; tar xvf -)
+# NVIDIA L4T (Tegra K1) X/GL blobs. The tarball still resolves on NVIDIA's
+# download host, but it is optional: a failed download must not kill the
+# install, it only leaves the desktop on software rendering.
+L4T_URL=${L4T_URL:-https://developer.download.nvidia.com/mobile/tegra/l4t/r21.1.0/Tegra124_Linux_R21.1.0_armhf.tbz2}
+l4t_ok=0
 
-# cuda symlinks
-ln -s libcuda.so.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so
-ln -s tegra/libcuda.so.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so.1
-ln -s tegra/libcuda.so.1.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so.1.1
+if [ "$NO_L4T" = "1" ]
+then
+  echo "NO_L4T=1 is set - skipping the NVIDIA GPU blobs."
+elif [ "$ubuntu_arch" != "armhf" ]
+then
+  echo "Skipping the NVIDIA L4T blobs (they are armhf only)."
+else
+  echo "Fetching the NVIDIA L4T GPU blobs ..."
+  l4tdir="`mktemp -d`"
+  l4t="`basename "$L4T_URL"`"
+  if fetch_to "$L4T_URL" "$l4tdir/$l4t"
+  then
+    if tar xpf "$l4tdir/$l4t" -C "$l4tdir" 2>/dev/null && [ -d "$l4tdir/Linux_for_Tegra/rootfs" ]
+    then
+      if ( cd "$l4tdir/Linux_for_Tegra/rootfs" \
+           && tar xpf ../nv_tegra/nvidia_drivers.tbz2 \
+           && tar cf - usr/lib | ( cd /tmp/urfs ; tar xf - ) )
+      then
+        l4t_ok=1
+      fi
+    fi
+  fi
+  rm -rf "$l4tdir"
+  if [ "$l4t_ok" != "1" ]
+  then
+    echo "WARNING: the NVIDIA L4T blobs could not be installed;" >&2
+    echo "         the desktop will fall back to software rendering." >&2
+  fi
+fi
 
-echo "/usr/lib/arm-linux-gnueabihf/tegra" > /tmp/urfs/etc/ld.so.conf.d/nvidia-tegra.conf
-echo "/usr/lib/arm-linux-gnueabihf/tegra-egl" > /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra-egl/ld.so.conf
-echo "/usr/lib/arm-linux-gnueabihf/tegra" > /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra/ld.so.conf
+if [ "$l4t_ok" = "1" ]
+then
+  # cuda symlinks
+  ln -sf libcuda.so.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so
+  ln -sf tegra/libcuda.so.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so.1
+  ln -sf tegra/libcuda.so.1.1 /tmp/urfs/usr/lib/arm-linux-gnueabihf/libcuda.so.1.1
+
+  mkdir -p /tmp/urfs/etc/ld.so.conf.d
+  echo "/usr/lib/arm-linux-gnueabihf/tegra" > /tmp/urfs/etc/ld.so.conf.d/nvidia-tegra.conf
+  mkdir -p /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra-egl /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra
+  echo "/usr/lib/arm-linux-gnueabihf/tegra-egl" > /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra-egl/ld.so.conf
+  echo "/usr/lib/arm-linux-gnueabihf/tegra" > /tmp/urfs/usr/lib/arm-linux-gnueabihf/tegra/ld.so.conf
+else
+  # No NVIDIA driver means the tegra X config would point at a missing driver.
+  rm -f /tmp/urfs/usr/share/X11/xorg.conf.d/tegra.conf
+fi
+
+mkdir -p /tmp/urfs/etc/udev/rules.d /tmp/urfs/lib/udev/rules.d /tmp/urfs/var/lib/alsa
 
 cat >/tmp/urfs/etc/udev/rules.d/99-tegra-lid-switch.rules <<EOF
 ACTION=="remove", GOTO="tegra_lid_switch_end"
@@ -415,8 +648,8 @@ KERNEL=="nvhost-ctrl", GROUP="video", MODE="0660"
 KERNEL=="nvhost-ctrl-gpu", GROUP="video", MODE="0660"
 KERNEL=="nvhost-dbg-gpu", GROUP="video", MODE="0660"
 KERNEL=="nvhost-gpu", GROUP="video", MODE="0660"
-KERNEL=="nvhost-msenc", GROUP="video", MODE=0660"
-KERNEL=="nvhost-prof-gpu", GROUP="video", MODE=0660"
+KERNEL=="nvhost-msenc", GROUP="video", MODE="0660"
+KERNEL=="nvhost-prof-gpu", GROUP="video", MODE="0660"
 KERNEL=="nvhost-tsec", GROUP="video", MODE="0660"
 KERNEL=="nvhost-vic", GROUP="video", MODE="0660"
 KERNEL=="nvmap", GROUP="video", MODE="0660"
@@ -2116,21 +2349,23 @@ state.Venice2 {
 }
 EOF
 
-cat > /tmp/urfs/install-tegra.sh <<EOF
-update-alternatives --install /etc/ld.so.conf.d/arm-linux-gnueabihf_EGL.conf arm-linux-gnueabihf_egl_conf /usr/lib/arm-linux-gnueabihf/tegra-egl/ld.so.conf 1000
-update-alternatives --install /etc/ld.so.conf.d/arm-linux-gnueabihf_GL.conf arm-linux-gnueabihf_gl_conf /usr/lib/arm-linux-gnueabihf/tegra/ld.so.conf 1000
+if [ "$l4t_ok" = "1" ]
+then
+  cat > /tmp/urfs/install-tegra.sh <<EOF
+update-alternatives --install /etc/ld.so.conf.d/arm-linux-gnueabihf_EGL.conf arm-linux-gnueabihf_egl_conf /usr/lib/arm-linux-gnueabihf/tegra-egl/ld.so.conf 1000 || true
+update-alternatives --install /etc/ld.so.conf.d/arm-linux-gnueabihf_GL.conf arm-linux-gnueabihf_gl_conf /usr/lib/arm-linux-gnueabihf/tegra/ld.so.conf 1000 || true
 ldconfig
-adduser user video
+adduser -q user video 2>/dev/null || true
 EOF
-#su user -c "xdg-settings set default-web-browser chromium.desktop"
 
-chmod a+x /tmp/urfs/install-tegra.sh
-chroot /tmp/urfs /bin/bash -c /install-tegra.sh
-rm /tmp/urfs/install-tegra.sh
+  chmod a+x /tmp/urfs/install-tegra.sh
+  chroot /tmp/urfs /bin/bash /install-tegra.sh
+  rm /tmp/urfs/install-tegra.sh
+fi
 
 echo "console=tty1 debug verbose root=${target_rootfs} rootwait rw lsm.module_locking=0" > kernel-config
 vbutil_arch="x86"
-if [ $ubuntu_arch = "armhf" ]
+if [ $ubuntu_arch = "armhf" ] || [ $ubuntu_arch = "arm64" ]
 then
   vbutil_arch="arm"
 fi
@@ -2138,6 +2373,14 @@ fi
 current_rootfs="`rootdev -s`"
 current_kernfs_num=$((${current_rootfs: -1:1}-1))
 current_kernfs=${current_rootfs: 0:-1}$current_kernfs_num
+
+if [ ! -f /usr/share/vboot/devkeys/kernel.keyblock ]
+then
+  echo "ERROR: the ChromeOS signing keys (/usr/share/vboot/devkeys) are missing." >&2
+  echo "       Make sure dev mode is on and the device was set up with" >&2
+  echo "       chromeos-firmwareupdate --mode=todev." >&2
+  exit 1
+fi
 
 vbutil_kernel --repack ${target_kern} \
     --oldblob $current_kernfs \
@@ -2158,10 +2401,15 @@ in Chrome OS. If you're happy with ChrUbuntu when you reboot be sure to run:
 
 sudo cgpt add -i 6 -P 5 -S 1 ${target_disk}
 
-To make it the default boot option. The ChrUbuntu login is:
+To make it the default boot option (a ChromeOS update can reset this; run the
+command again if the device boots back into ChromeOS). The ChrUbuntu login is:
 
 Username:  user
 Password:  user
+
+Change that password right after the first login:
+
+sudo passwd user
 
 We're now ready to start ChrUbuntu!
 "
