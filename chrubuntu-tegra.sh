@@ -377,11 +377,88 @@ then
   exit 1
 fi
 
-if mount | grep -q "^${target_rootfs} on "
-then
-  echo "Refusing to continue since ${target_rootfs} is formatted and mounted. Try rebooting"
-  exit 1
-fi
+is_mounted() {
+  # mount output is "<dev> on <dir> type <fs> (...)"; match the whole field so
+  # /tmp/urfs does not also match /tmp/urfs/sys.
+  mount | grep -q " on $1 "
+}
+
+target_mounted() {
+  mount | grep -q "^${target_rootfs} on "
+}
+
+free_target_rootfs() {
+  # A previous run can leave the target mounted: an older version of this
+  # script died after mounting /tmp/urfs (it needed wget to download), and
+  # nothing ever unmounted it. A leftover mount is not a reason to abort, it
+  # only has to be released before mkfs and a fresh mount.
+  local line mp m
+  target_mounted || return 0
+
+  line="`mount | grep "^${target_rootfs} on " | head -1`"
+  echo ""
+  echo "WARNING: ${target_rootfs} is already mounted:"
+  echo "  $line"
+  mp="`echo "$line" | sed -n 's/^[^ ]* on \\(.*\\) type .*/\\1/p'`"
+  echo "Unmounting it so the install can continue ..."
+
+  for m in "$mp" /tmp/urfs "$target_rootfs"
+  do
+    [ -n "$m" ] || continue
+    if target_mounted; then
+      umount "$m" 2>/dev/null || true
+    fi
+  done
+
+  # Last resort: a lazy unmount detaches the mount even when a stale chroot
+  # process still holds a file open.
+  if target_mounted
+  then
+    for m in "$mp" /tmp/urfs
+    do
+      [ -n "$m" ] || continue
+      umount -l "$m" 2>/dev/null || true
+    done
+    sleep 1
+  fi
+
+  if target_mounted
+  then
+    echo "" >&2
+    echo "ERROR: ${target_rootfs} is mounted and could not be unmounted" >&2
+    echo "       automatically. Free it by hand and re-run this script:" >&2
+    echo "" >&2
+    echo "         sudo umount /tmp/urfs" >&2
+    echo "         sudo umount ${target_rootfs}" >&2
+    echo "" >&2
+    echo "       If it still says the target is busy, reboot the Chromebook" >&2
+    echo "       (Ctrl-Alt-T, type 'shell', then 'sudo reboot') and start over." >&2
+    echo "       Do not run mkfs on a mounted partition; that corrupts it." >&2
+    exit 1
+  fi
+  echo "Unmounted ${target_rootfs}; continuing."
+  echo ""
+}
+
+cleanup_chroot() {
+  # Runs on every exit path, including a failed install, so the next run never
+  # starts with the target partition still mounted.
+  local m
+  for m in sys dev/pts dev proc
+  do
+    if is_mounted "/tmp/urfs/$m"; then
+      umount "/tmp/urfs/$m" 2>/dev/null || true
+    fi
+  done
+  if is_mounted /tmp/urfs; then
+    umount /tmp/urfs 2>/dev/null || umount -l /tmp/urfs 2>/dev/null || true
+  fi
+  return 0
+}
+
+trap cleanup_chroot EXIT
+
+free_target_rootfs
 
 mkfs.ext4 -F ${target_rootfs}
 
@@ -389,7 +466,12 @@ if [ ! -d /tmp/urfs ]
 then
   mkdir /tmp/urfs
 fi
-mount -t ext4 ${target_rootfs} /tmp/urfs
+if ! mount -t ext4 ${target_rootfs} /tmp/urfs
+then
+  echo "ERROR: could not mount ${target_rootfs} on /tmp/urfs." >&2
+  echo "       Run 'sudo e2fsck -f ${target_rootfs}' if mkfs complained above." >&2
+  exit 1
+fi
 
 echo "Downloading the Ubuntu base image ..."
 tarball="`mktemp`"
@@ -2415,5 +2497,9 @@ We're now ready to start ChrUbuntu!
 "
 
 read -p "Press [Enter] to reboot..."
+
+# Release the chroot mounts before rebooting; the EXIT trap also does this,
+# but doing it here keeps the filesystem clean for the shutdown that follows.
+cleanup_chroot
 
 reboot

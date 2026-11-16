@@ -129,6 +129,17 @@ the device boots into ChromeOS instead of Ubuntu, run the command above again.
   device already boots unsigned kernels.
 * `no ubuntu-base image for Ubuntu X on armhf` — that release was never built
   for your CPU; the script names a release that exists in the error message.
+* `Refusing to continue since /dev/mmcblk0p7 is formatted and mounted` — an
+  earlier run left the partition mounted at `/tmp/urfs` (older versions of this
+  script aborted mid-install and never unmounted it). Current versions release
+  the mount automatically. On an old copy, free it by hand and re-run:
+
+                    $ sudo umount /tmp/urfs
+                    $ sudo umount /dev/mmcblk0p7      # only if still mounted
+                    $ sudo bash chrubuntu-tegra.sh default 22.04 /dev/mmcblk1
+
+  If `umount` says the target is busy, reboot ChromeOS and start again rather
+  than forcing `mkfs` on a mounted partition.
 * The install completed but X does not start — see the `libglx.so` workaround
   above, and check `NO_L4T` (the `tegra.conf` X configuration is only written
   when the NVIDIA blobs actually installed).
