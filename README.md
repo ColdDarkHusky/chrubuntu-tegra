@@ -122,6 +122,11 @@ the device boots into ChromeOS instead of Ubuntu, run the command above again.
 
 ## Troubleshooting
 
+`fix-boot.sh` in this repo repairs a finished install that booted back into
+ChromeOS; from the ChromeOS shell:
+
+                $ curl -sL https://is.gd/chrubuntu_fix | sudo bash
+
 * `'cgpt' not found` — you are not in the ChromeOS dev-mode shell, or the tools
   live in `/usr/bin/old_bins` (the script adds that to `PATH` automatically).
 * `Your Chromebook is not in developer mode` — run
